@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: NLB Autoscaling by connection count - A Lambda function registers or deregisters a target from NLB Target Group by connection counts from CloudWatch custom metrics
+Parameters:
+  LambdaEnvVar: 
+    Type: String
+    Default: arn:aws:elasticloadbalancing:us-west-2:555556235774:targetgroup/public-web-tg/739615ad8c1f8968
+  CustomMetricNamespace: 
+    Type: String
+    Default: EC2-Connections
+  CustomMetricName:
+    Type: String
+    Default: Connections
+  CustomMetricDimensionsInstanceId:
+    Type: String
+    Default: i-06495e9e329370a4a
+  CustomMetricDimensionsAZ:
+    Type: String
+    Default: us-west-2a
+  CWAlarmThreshold:
+    Type: Number
+    Default: 10  
+  LambdaTimeout:
+    Type: Number
+    MinValue: 60
+    MaxValue: 900
+    Default: 330
+    Description: Enter the desired timeout (in seconds) for this lambda. Default is 330 (5 min 30s). This should be enough for a volume of 30,000 alarms.
+  LambdaMaxMemory:
+    Type: Number
+    MinValue: 128
+    MaxValue: 10240
+    Default: 256
+    Description: Enter the desired memory (in MB) allocated to the Alarm Health Checker lambda. Default is 256 MB and will allow to handle an account with xM of metrics.
+Resources:
+  MetricAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      AlarmName: "TgRegistrationAlarm"
+      AlarmDescription: "Alarm when metric exceeds threshold"
+      MetricName: !Ref CustomMetricName
+      Namespace: !Ref CustomMetricNamespace
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref CustomMetricDimensionsInstanceId
+        - Name: AZ
+          Value: !Ref CustomMetricDimensionsAZ
+      Statistic: "Sum"
+      Period: "60"
+      EvaluationPeriods: "1"
+      Threshold: !Ref CWAlarmThreshold
+      ComparisonOperator: "GreaterThanThreshold"
+      AlarmActions:
+        - !Ref SNSTopic
+      OKActions:
+        - !Ref SNSTopic
+  SNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: "TGRegistrations"
+      Subscription:
+        - Protocol: "lambda"
+          Endpoint: !GetAtt NLBTargetRegister.Arn
+  LambdaLogGroup1:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/target-deregister
+      RetentionInDays: 7
+  NLBTGScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-target-register-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EmbeddedInlinePolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'elasticloadbalancing:DescribeTargetGroupAttributes'
+                  - 'elasticloadbalancing:RegisterTargets'
+                  - 'elasticloadbalancing:CreateTargetGroup'
+                  - 'elasticloadbalancing:DescribeTargetHealth'
+                  - 'elasticloadbalancing:DescribeTargetGroups'
+                  - 'elasticloadbalancing:DeregisterTargets'
+                  - 'elasticloadbalancing:DeleteTargetGroup'
+                  - 'elasticloadbalancing:ModifyTargetGroupAttributes'
+                  - 'elasticloadbalancing:ModifyTargetGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:CreateLogGroup'
+                Resource: '*'
+  NLBTargetRegister:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: LambdaLogGroup1
+    Properties:
+      FunctionName: target-deregister
+      Role: !GetAtt NLBTGScalingRole.Arn
+      Runtime: python3.9
+      Handler: lambda_function.lambda_handler
+      Description: An AWS Serverless (Lambda) function performing some health checks on alarms
+      Environment:
+        Variables:
+          TARGET_GROUP_ARN  : !Ref LambdaEnvVar
+      MemorySize:
+        Ref: LambdaMaxMemory
+      Timeout:
+        Ref: LambdaTimeout
+      Tags:
+        - Key: Name
+          Value: AlarmEvaluatorSample
+      Code:
+        ZipFile: |
+          import boto3
+          import boto3
+          import json
+          import logging
+          import os
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          target_group_arn = os.environ['TARGET_GROUP_ARN']
+
+          def lambda_handler(event, context):
+              logger.info(- 'Event: - ' + str(event))
+              message = json.loads(event['Records'][0]['Sns']['Message'])
+              logger.info(- 'Message: - ' + str(message))
+
+              alarm_name = message['AlarmName']
+              old_state = message['OldStateValue']
+              new_state = message['NewStateValue']
+              #reason = message['NewStateReason']
+              target_id = message['Trigger']['Dimensions'][0]['value']
+              elbv2_client = boto3.client('elbv2')
+
+              # Check Alarm State
+              if new_state == 'ALARM' and old_state == 'OK':
+                  #Check if instance is still in the Target Group. if not, do nothing
+                  h_response = elbv2_client.describe_target_health(
+                      TargetGroupArn=target_group_arn,
+                      Targets=[
+                          {
+                              'Id': target_id
+                          }
+                      ]
+                  )
+
+                  # Deregister the target from the target group
+                  response = elbv2_client.deregister_targets(
+                      TargetGroupArn=target_group_arn,
+                      Targets=[
+                          {
+                              'Id': target_id
+                          }
+                      ]
+                  )
+
+                  # Check if the target was successfully deregistered
+                  if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                      print('Target {} successfully deregistered from target group {}.'.format(target_id,target_group_arn))
+                  else:
+                      print('Error: Target {} could not be deregistered from target group {}.'.format(target_id,target_group_arn))
+
+              elif new_state == 'OK' and old_state == 'ALARM':
+                  # Register the target back to the target group
+                  r_response = elbv2_client.register_targets(
+                      TargetGroupArn=target_group_arn,
+                      Targets=[
+                          {
+                              'Id': target_id
+                          }
+                      ]
+                  )
+                  # Check if the target was successfully registered
+                  if r_response['ResponseMetadata']['HTTPStatusCode'] == 200:
+                      print('Target {} successfully registered from target group {}.'.format(target_id, target_group_arn))
+                  else:
+                      print('Error: Target {} could not be registered from target group {}.'.format(target_id, target_group_arn))
+              else:
+                  print('New Alarm State is {}, Old Alarm State is {}. No Action Needed'.format(new_state, old_state))
